@@ -1,9 +1,12 @@
 [project]
-name = "gemini-cli-solver"
+name = "arc-solver"
 version = "0.1.0"
-description = "Gemini CLI agent solver for ARC-AGI tasks"
+description = "Local Docker agent solver for ARC-AGI tasks"
 requires-python = ">=3.11"
-dependencies = ["e2b>=1.0.0"]
+dependencies = [
+    "aiodocker>=0.21.0",
+    "openai>=1.0.0",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["."]

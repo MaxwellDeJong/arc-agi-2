@@ -39,7 +39,7 @@ else
     GEMINI_CLI_TASKS="all"
     GEMINI_CLI_AGENTS=12
     GEMINI_CLI_MAX_ITERATIONS=10
-    GEMINI_CLI_CONCURRENCY=132
+    GEMINI_CLI_CONCURRENCY=8
     RUN_NAME="FINAL_RUN"
 fi
 
@@ -47,8 +47,10 @@ echo "Script dir: $SCRIPT_DIR"
 echo ""
 
 # ── Start solver ─────────────────────────────────────────────────────────
-echo "--- Starting Gemini CLI solver ---"
-echo "[gemini-cli] $GEMINI_CLI_AGENTS agents, max-iterations $GEMINI_CLI_MAX_ITERATIONS"
+LOCAL_LLM_MODEL="${LOCAL_LLM_MODEL:-unsloth/Qwen3.5-35B-A3B-GGUF}"
+
+echo "--- Starting local LLM solver ---"
+echo "[local-llm] model=$LOCAL_LLM_MODEL, $GEMINI_CLI_AGENTS agents, max-iterations $GEMINI_CLI_MAX_ITERATIONS"
 echo ""
 
 cd "$SCRIPT_DIR/gemini-cli-solver"
@@ -57,6 +59,7 @@ uv run python orchestrator.py \
     --num-agents "$GEMINI_CLI_AGENTS" \
     --max-iterations "$GEMINI_CLI_MAX_ITERATIONS" \
     --concurrency "${GEMINI_CLI_CONCURRENCY:-4}" \
+    --model "$LOCAL_LLM_MODEL" \
     --name "$RUN_NAME" &
 PID_SOLVER=$!
 
@@ -115,9 +118,9 @@ set -e
 echo ""
 echo "--- Solver result ---"
 if [[ $SOLVER_EXIT -eq 0 ]]; then
-    echo "[gemini-cli] SUCCESS"
+    echo "[local-llm] SUCCESS"
 else
-    echo "[gemini-cli] FAILED (exit code $SOLVER_EXIT)"
+    echo "[local-llm] FAILED (exit code $SOLVER_EXIT)"
 fi
 echo ""
 

@@ -1,14 +1,14 @@
-"""Orchestrator: dispatches Gemini CLI agents to E2B sandboxes.
+"""Orchestrator: dispatches local LLM agents to Docker containers.
 
 The orchestrator runs locally and handles:
 - Task loading from ARC-AGI data files
-- Dispatching agents to E2B sandboxes with Gemini CLI pre-installed
+- Dispatching local LLM agents to Docker containers with the solver image
 - Writing logs (raw_stream, transcript, readable, attempts)
 - Results aggregation and summary.json
 - Resume logic (skip completed tasks)
 
-Each agent runs in its own E2B Firecracker microVM with network restricted
-to generativelanguage.googleapis.com via SNI domain filtering.
+Each agent runs in its own Docker container with the solver image.
+The orchestrator builds the image from gemini-cli-solver/Dockerfile at startup.
 
 Usage:
   uv run python orchestrator.py --tasks 0934a4d8 --num-agents 1
@@ -23,10 +23,14 @@ import logging
 import os
 import random
 import re
+import shutil
 import sys
+import tempfile
 import time
 from collections.abc import Callable
 from pathlib import Path
+
+import aiodocker
 
 # Force line-buffered stdout so background runs show live progress
 sys.stdout.reconfigure(line_buffering=True)
@@ -36,13 +40,12 @@ ROOT = Path(__file__).resolve().parent
 CHALLENGES_FILE = ROOT.parent / "data" / "arc-agi_evaluation_challenges.json"
 RESULTS = ROOT / "results"
 AGENT_RUNNER_PATH = ROOT / "agent_runner.py"
+LOCAL_CLI_PATH = ROOT / "local_agent_cli.py"
 
 
-# ── E2B Sandbox Helpers ───────────────────────────────────────────────────
+# ── Docker Sandbox Helpers ────────────────────────────────────────────────
 
-# E2B resource configuration
-E2B_CPU_COUNT = 2               # vCPUs per sandbox
-E2B_COST_PER_VCPU_HOUR = 0.05  # E2B pricing: $0.05/hour per vCPU
+# Docker containers have no per-usage infrastructure cost.
 
 # Status event formatters for pretty-printing agent status events
 _EVENT_FORMATTERS: dict[str, Callable[[dict], str]] = {
@@ -56,7 +59,22 @@ _EVENT_FORMATTERS: dict[str, Callable[[dict], str]] = {
 }
 
 
-async def run_agent_in_e2b(
+async def _build_image(image: str) -> None:
+    """Build the Docker image from the Dockerfile in gemini-cli-solver/."""
+    print(f"[docker] Building image {image} ...")
+    proc = await asyncio.create_subprocess_exec(
+        "docker", "build", "-t", image, str(ROOT),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+    stdout, _ = await proc.communicate()
+    if proc.returncode != 0:
+        output = stdout.decode() if stdout else ""
+        raise RuntimeError(f"docker build failed:\n{output}")
+    print(f"[docker] Image {image} built successfully")
+
+
+async def run_agent_in_docker(
     task_id: str,
     agent_id: str,
     raw_task: dict,
@@ -64,109 +82,120 @@ async def run_agent_in_e2b(
     model: str,
     max_iterations: int,
     soft_training_feedback: bool,
+    image: str = "arc-solver:latest",
 ) -> dict:
-    """Run a Gemini CLI agent inside an E2B Firecracker sandbox.
+    """Run a Gemini CLI agent inside a Docker container.
 
-    Network isolation uses E2B's SNI-based domain filtering: all outbound traffic
-    is denied by default, with an allowlist for Google API endpoints only.
+    Mounts three host temp directories as volumes:
+      /root      — config.json (read by agent_runner.py)
+      /app       — agent_runner.py
+      /workspace — results.json written here by agent_runner.py
     """
-    from e2b import ALL_TRAFFIC, AsyncSandbox
-
-    envs: dict[str, str] = {}
-    gemini_key = os.environ.get("GEMINI_API_KEY")
-    if gemini_key:
-        envs["GEMINI_API_KEY"] = gemini_key
-
-    config = {
-        "task_id": task_id,
-        "agent_id": agent_id,
-        "raw_task": raw_task,
-        "test_index": test_index,
-        "model": model,
-        "max_iterations": max_iterations,
-        "soft_training_feedback": soft_training_feedback,
-    }
-
-    network = {
-        "deny_out": [ALL_TRAFFIC],
-        "allow_out": ["generativelanguage.googleapis.com"],
-    }
-
-    # Retry sandbox creation with exponential backoff (handles concurrency limits)
-    sandbox = None
-    sandbox_start = time.time()
-    for attempt in range(5):
-        try:
-            sandbox = await AsyncSandbox.create(
-                template="arc-gemini-solver",
-                envs=envs,
-                network=network,
-                timeout=43500,  # sandbox lifetime: 12h + 5min buffer
-            )
-            sandbox_start = time.time()
-            break
-        except Exception as e:
-            if attempt == 4:
-                raise
-            wait = 2 ** attempt * 5  # 5s, 10s, 20s, 40s
-            print(f"  [e2b] {agent_id}: sandbox create failed (attempt {attempt + 1}/5), retrying in {wait}s: {e}")
-            await asyncio.sleep(wait)
+    container_start = time.time()
+    container = None
+    tmp_root = tmp_app = tmp_workspace = None
+    docker_client = aiodocker.Docker()
 
     try:
-        # Write config to /root/ — deleted by agent_runner before starting Gemini
-        await sandbox.files.write("/root/config.json", json.dumps(config))
-        # Upload agent_runner.py into sandbox
-        await sandbox.files.write("/app/agent_runner.py", AGENT_RUNNER_PATH.read_text())
+        # Step 1 — Create temp directories and write files
+        tmp_root = tempfile.mkdtemp()
+        tmp_app = tempfile.mkdtemp()
+        tmp_workspace = tempfile.mkdtemp()
 
-        # stdout/stderr callbacks for live status
-        def on_stdout(output) -> None:
-            line = output.line if hasattr(output, "line") else str(output)
+        config = {
+            "task_id": task_id,
+            "agent_id": agent_id,
+            "raw_task": raw_task,
+            "test_index": test_index,
+            "model": model,
+            "max_iterations": max_iterations,
+            "soft_training_feedback": soft_training_feedback,
+        }
+        (Path(tmp_root) / "config.json").write_text(json.dumps(config))
+        (Path(tmp_app) / "agent_runner.py").write_text(AGENT_RUNNER_PATH.read_text())
+        (Path(tmp_app) / "local_agent_cli.py").write_text(LOCAL_CLI_PATH.read_text())
+
+        # Step 2 — Build environment variables
+        envs: dict[str, str] = {}
+        vllm_url = os.environ.get("VLLM_BASE_URL", "http://host.docker.internal:8000/v1")
+        # Containers can't reach 'localhost' — remap to the Docker host gateway
+        # so users can keep the natural http://localhost:8000/v1 in their .env.
+        vllm_url = vllm_url.replace("://localhost:", "://host.docker.internal:") \
+                            .replace("://127.0.0.1:", "://host.docker.internal:")
+        envs["VLLM_BASE_URL"] = vllm_url
+        envs["VLLM_API_KEY"] = os.environ.get("VLLM_API_KEY", "not-needed")
+
+        # Step 3 — Run the container
+        container = await docker_client.containers.run(
+            config={
+                "Image": image,
+                "Cmd": ["python3", "/app/agent_runner.py"],
+                "Env": [f"{k}={v}" for k, v in envs.items()],
+                "HostConfig": {
+                    "Binds": [
+                        f"{tmp_root}:/root",
+                        f"{tmp_app}:/app",
+                        f"{tmp_workspace}:/workspace",
+                    ],
+                    "Memory": 5 * 1024 * 1024 * 1024,  # 5 GiB
+                    "NanoCpus": 2 * 10 ** 9,            # 2 CPUs
+                    "AutoRemove": False,
+                    "ExtraHosts": ["host.docker.internal:host-gateway"],
+                },
+            }
+        )
+
+        stderr_lines: list[str] = []
+        async for log_line in container.log(stdout=True, stderr=True, follow=True):
+            line = log_line.rstrip("\n")
+            if not line:
+                continue
             try:
                 event = json.loads(line)
                 if isinstance(event, dict):
-                    evt_type = event.get("event", "?")
+                    evt_type = event.get("event", "")
                     aid = event.get("agent_id", "?")
                     formatter = _EVENT_FORMATTERS.get(evt_type)
                     if formatter:
                         detail = formatter(event)
                         print(f"  [status] {aid}: {detail}")
             except (json.JSONDecodeError, TypeError):
-                pass
+                if line.strip():
+                    print(f"  [docker-stderr] {agent_id}: {line[:200]}")
+                    stderr_lines.append(line)
 
-        def on_stderr(output) -> None:
-            line = output.line if hasattr(output, "line") else str(output)
-            if line.strip():
-                print(f"  [e2b-stderr] {agent_id}: {line[:200]}")
+        exit_info = await container.wait()
+        exit_code = exit_info.get("StatusCode", -1)
 
-        await sandbox.commands.run(
-            "python3 /app/agent_runner.py",
-            user="root",
-            timeout=43200 + 120,  # 12h + 2min buffer
-            on_stdout=on_stdout,
-            on_stderr=on_stderr,
-        )
+        container_duration = time.time() - container_start
 
-        # Read results
-        results_content = await sandbox.files.read("/workspace/results.json")
-        result = json.loads(results_content)
+        # Step 4 — Read results from workspace volume
+        results_path = Path(tmp_workspace) / "results.json"
+        try:
+            result = json.loads(results_path.read_text())
+        except (FileNotFoundError, json.JSONDecodeError) as read_err:
+            return {
+                "task_id": task_id,
+                "agent_id": agent_id,
+                "test_index": test_index,
+                "attempts": [],
+                "elapsed": 0,
+                "cost": 0,
+                "container_duration": container_duration,
+                "turns": 0,
+                "error": f"Docker container error: could not read results.json (exit_code={exit_code}): {read_err}",
+                "raw_lines": [],
+                "stderr": "\n".join(stderr_lines),
+            }
 
-        # Calculate E2B cost
-        sandbox_duration = time.time() - sandbox_start
-        e2b_cost = (sandbox_duration / 3600) * E2B_CPU_COUNT * E2B_COST_PER_VCPU_HOUR
-
-        # Add E2B cost tracking to results
-        result["e2b_cost"] = e2b_cost
-        result["e2b_duration"] = sandbox_duration
-        result["total_cost"] = result.get("cost", 0) + e2b_cost
-
-        print(f"  [e2b-cost] {agent_id}: Gemini=${result.get('cost', 0):.4f}, E2B=${e2b_cost:.4f}, Total=${result['total_cost']:.4f}, Duration={sandbox_duration:.1f}s")
-
-        return result
+        # Step 5 — Return result
+        return {
+            **result,
+            "container_duration": container_duration,
+        }
 
     except Exception as e:
-        sandbox_duration = time.time() - sandbox_start
-        e2b_cost = (sandbox_duration / 3600) * E2B_CPU_COUNT * E2B_COST_PER_VCPU_HOUR
-
+        container_duration = time.time() - container_start
         return {
             "task_id": task_id,
             "agent_id": agent_id,
@@ -174,16 +203,23 @@ async def run_agent_in_e2b(
             "attempts": [],
             "elapsed": 0,
             "cost": 0,
-            "e2b_cost": e2b_cost,
-            "e2b_duration": sandbox_duration,
-            "total_cost": e2b_cost,
+            "container_duration": container_duration,
             "turns": 0,
-            "error": f"E2B sandbox error: {e}",
+            "error": f"Docker container error: {e}",
             "raw_lines": [],
             "stderr": "",
         }
     finally:
-        await sandbox.kill()
+        # Step 6 — Remove container and clean up temp directories
+        if container is not None:
+            try:
+                await container.delete(force=True)
+            except Exception:
+                pass
+        await docker_client.close()
+        for tmp_dir in (tmp_root, tmp_app, tmp_workspace):
+            if tmp_dir:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 # ── Task Loading ────────────────────────────────────────────────────────────
@@ -492,7 +528,7 @@ MAX_BACKOFF_S = 600.0  # 10 min cap
 logger = logging.getLogger(__name__)
 
 
-async def _retry_e2b_call(coro_fn, *, agent_id: str) -> dict:
+async def _retry_backend_call(coro_fn, *, agent_id: str) -> dict:
     """Call an async function with exponential backoff + jitter on transient failures."""
     for attempt in range(1, MAX_RETRIES + 1):
         try:
@@ -505,7 +541,6 @@ async def _retry_e2b_call(coro_fn, *, agent_id: str) -> dict:
                 "eof", "transport", "503", "502",
                 "429", "rate limit", "resource_exhausted",
                 "overloaded", "too many requests",
-                "stopped or disabled",
             ))
             if not is_transient or attempt == MAX_RETRIES:
                 raise
@@ -567,7 +602,7 @@ async def process_task(
     run_dir: Path,
     backend_queue: asyncio.Queue[str] | None,
 ) -> dict:
-    """Orchestrate N agents per test input via E2B, save results independently."""
+    """Orchestrate N agents per test input via Docker containers, save results independently."""
     raw_task = load_task_json(task_id)
     num_tests = len(raw_task["test"])
 
@@ -580,15 +615,15 @@ async def process_task(
         before waiting for other agents (safety net for early termination).
         """
         if backend_queue is None:
-            result = await _retry_e2b_call(
-                lambda kw=kwargs: run_agent_in_e2b(**kw),
+            result = await _retry_backend_call(
+                lambda kw=kwargs: run_agent_in_docker(**kw),
                 agent_id=agent_id,
             )
         else:
             token = await backend_queue.get()
             try:
-                result = await _retry_e2b_call(
-                    lambda kw=kwargs: run_agent_in_e2b(**kw),
+                result = await _retry_backend_call(
+                    lambda kw=kwargs: run_agent_in_docker(**kw),
                     agent_id=agent_id,
                 )
             finally:
@@ -604,9 +639,7 @@ async def process_task(
                 "test_index": test_index,
                 "attempts": [a["grid"] for a in attempts],
                 "cost": result.get("cost", 0),
-                "e2b_cost": result.get("e2b_cost", 0),
-                "e2b_duration": result.get("e2b_duration", 0),
-                "total_cost": result.get("total_cost", 0),
+                "container_duration": result.get("container_duration", 0),
                 "turns": result.get("turns", 0),
                 "usage": result.get("usage", {}),
             }
@@ -630,6 +663,7 @@ async def process_task(
                 model=args.model,
                 max_iterations=args.max_iterations,
                 soft_training_feedback=args.soft_training_feedback,
+                image=args.image,
             )
             agent_coros.append(_dispatch(agent_id, _kwargs, ti, agent_log_dir))
 
@@ -657,9 +691,7 @@ async def process_task(
             "test_index": ti,
             "attempts": [a["grid"] for a in attempts],
             "cost": result.get("cost", 0),
-            "e2b_cost": result.get("e2b_cost", 0),
-            "e2b_duration": result.get("e2b_duration", 0),
-            "total_cost": result.get("total_cost", 0),
+            "container_duration": result.get("container_duration", 0),
             "turns": result.get("turns", 0),
             "usage": result.get("usage", {}),
         }
@@ -668,8 +700,7 @@ async def process_task(
     total = num_tests
 
     valid_results = [r for r in agent_results if isinstance(r, dict)]
-    total_cost = sum(r.get("cost", 0) for r in valid_results)  # Gemini API cost
-    total_e2b_cost = sum(r.get("e2b_cost", 0) for r in valid_results)  # E2B infrastructure cost
+    total_cost = sum(r.get("cost", 0) for r in valid_results)
     elapsed = max((r.get("elapsed", 0) for r in valid_results), default=0)
 
     # Aggregate token usage across all agents
@@ -688,9 +719,7 @@ async def process_task(
         "submitted": submitted,
         "total": total,
         "elapsed": round(elapsed, 1),
-        "gemini_api_cost": round(total_cost, 4),
-        "e2b_cost": round(total_e2b_cost, 4),
-        "total_cost": round(total_cost + total_e2b_cost, 4),
+        "api_cost": round(total_cost, 4),
         "usage": total_usage,
     }
 
@@ -763,11 +792,14 @@ async def run_all(args: argparse.Namespace):
         all_scores[tid] = score
         total_submitted += score.get("submitted", 0)
         total_tests += score.get("total", 0)
-        total_cost += score.get("total_cost", score.get("cost", 0))
+        total_cost += score.get("api_cost", score.get("cost", 0))
 
     completed = len(completed_tasks)
 
-    # Shared slot queue: each token represents one E2B sandbox slot
+    # Build the Docker image before dispatching any agents
+    await _build_image(args.image)
+
+    # Shared slot queue: each token represents one Docker container slot
     backend_queue: asyncio.Queue[str] | None = None
     if args.concurrency > 0:
         backend_queue = asyncio.Queue()
@@ -786,7 +818,7 @@ async def run_all(args: argparse.Namespace):
         score = result["score"]
         total_submitted += score["submitted"]
         total_tests += score["total"]
-        total_cost += score.get("total_cost", 0)
+        total_cost += score.get("api_cost", 0)
         all_scores[task_id] = score
 
         completed += 1
@@ -828,23 +860,25 @@ async def run_all(args: argparse.Namespace):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="ARC-AGI Gemini CLI Solver (E2B)")
+    parser = argparse.ArgumentParser(description="ARC-AGI Local LLM Solver (Docker)")
     parser.add_argument("--tasks", default="all",
                         help="'all' (default) | comma-separated IDs")
     parser.add_argument("--num-agents", type=int, default=1,
                         help="Agents per test input (default: 1)")
     parser.add_argument("--max-iterations", type=int, default=10,
                         help="Max transform loop iterations per agent (default: 10)")
-    parser.add_argument("--model", default="gemini-3.1-pro-preview",
-                        help="Gemini model name (default: gemini-3.1-pro-preview)")
+    parser.add_argument("--model", default="google/gemma-3-27b-it",
+                        help="Model name to request from the local inference server (default: google/gemma-3-27b-it)")
     parser.add_argument("--name", default=None,
                         help="Name prefix for results directory (e.g. 'GEMINI_3_FLASH_1x')")
     parser.add_argument("--resume", default=None,
                         help="Resume a previous run directory")
     parser.add_argument("--soft-training-feedback", action="store_true", default=False,
                         help="Use softer training failure message ('Try again' instead of 'Try a fundamentally different approach')")
-    parser.add_argument("--concurrency", type=int, default=40,
-                        help="Max simultaneous E2B sandboxes (agent-level). Default: 40. Set to 0 for unlimited.")
+    parser.add_argument("--concurrency", type=int, default=8,
+                        help="Max simultaneous Docker containers (agent-level). Default: 8. Set to 0 for unlimited.")
+    parser.add_argument("--image", default="arc-solver:latest",
+                        help="Docker image to use for agent containers (default: arc-solver:latest)")
     args = parser.parse_args()
 
     asyncio.run(run_all(args))
