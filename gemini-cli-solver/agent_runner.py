@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""ARC-AGI Gemini CLI Agent Runner — runs inside E2B sandbox.
+"""ARC-AGI Local LLM Agent Runner — runs inside Docker container.
 
-Self-contained script that runs Gemini CLI sessions to solve an ARC task.
+Self-contained script that runs local LLM agent sessions to solve an ARC task.
 
 Communication:
   - Config:  Reads /root/config.json (then DELETES it)
@@ -40,7 +40,7 @@ GEMINI_MD = """\
 Read `task.json`. It has `train` (input/output pairs) and `test` (one test input).
 Find the transformation pattern and apply it to the test input.
 
-Use `python3` for scripting. All common scientific/mathematical packages are pre-installed — use whatever you need.
+Use `python3` for scripting. All common scientific/mathematical packages are pre-installed.
 
 Output grids must contain only integers 0-9.
 
@@ -53,33 +53,14 @@ When analyzing, consider: object manipulation, color changes, spatial patterns,
 object relationships, grid structure (borders, separators, subgrids).
 """
 
-# ── Gemini API Pricing ────────────────────────────────────────────────────────
-
-# (input, output, cached) per 1M tokens — <=200K tier for tiered models
-GEMINI_PRICING: dict[str, tuple[float, float, float]] = {
-    "gemini-3-flash-preview":  (0.50,  3.00,  0.05),
-    "gemini-2.5-flash":        (0.30,  2.50,  0.03),
-    "gemini-3.1-pro-preview":  (2.00, 12.00,  0.20),
-    "gemini-2.5-pro":          (1.25, 10.00,  0.125),
-}
-
-
 def calculate_cost(
     model: str,
     input_tokens: int,
     cached_tokens: int,
     output_tokens: int,
 ) -> float:
-    """Calculate USD cost from token counts using the pricing table."""
-    pricing = GEMINI_PRICING.get(model)
-    if pricing is None:
-        return 0.0
-    input_rate, output_rate, cached_rate = pricing
-    return (
-        input_tokens * input_rate / 1_000_000
-        + cached_tokens * cached_rate / 1_000_000
-        + output_tokens * output_rate / 1_000_000
-    )
+    """Local inference: no API cost."""
+    return 0.0
 
 
 # ── Grid extraction ─────────────────────────────────────────────────────────
@@ -240,8 +221,8 @@ def prepare_workspace(
     """
     ws = Path("/workspace")
     ws.mkdir(parents=True, exist_ok=True)
-    gemini_dir = ws / ".gemini"
-    gemini_dir.mkdir(parents=True, exist_ok=True)
+    local_agent_dir = ws / ".local_agent"
+    local_agent_dir.mkdir(parents=True, exist_ok=True)
 
     # task.json: train + single test input (no output/answer)
     public_task = {
@@ -252,27 +233,14 @@ def prepare_workspace(
 
     (ws / "GEMINI.md").write_text(GEMINI_MD)
 
-    # .gemini/settings.json — let agents run as long as they need
+    # .local_agent/settings.json — let agents run as long as they need
+    # base_url is intentionally omitted here; it comes from VLLM_BASE_URL env var.
     settings = json.dumps({
-        "model": {
-            "maxSessionTurns": 500,
-            "disableLoopDetection": True,
-        },
-        "shell": {
-            "inactivityTimeout": 1800,
-        },
-        "agents": {
-            "overrides": {
-                "generalist": {
-                    "runConfig": {
-                        "maxTurns": 200,
-                        "maxTimeMinutes": 360,
-                    }
-                }
-            }
-        },
+        "max_turns": 200,
+        "max_time_minutes": 360,
+        "inactivity_timeout": 1800,
     }, indent=2)
-    (ws / ".gemini" / "settings.json").write_text(settings)
+    (ws / ".local_agent" / "settings.json").write_text(settings)
 
     return ws
 
@@ -379,7 +347,7 @@ def run_agent(config: dict) -> dict:
         _status({"event": "started", "model": model})
 
         initial_prompt = "Read GEMINI.md, then solve the ARC puzzle in task.json."
-        gemini_cmd_base = f"gemini -y -m {model} -o stream-json"
+        gemini_cmd_base = f"python3 /app/local_agent_cli.py -y -m {model} -o stream-json"
 
         # ── Transform loop: validate + retry with --resume ──
         feedback = ""
