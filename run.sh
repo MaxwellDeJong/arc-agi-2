@@ -32,14 +32,14 @@ if [[ -n "$SMOKE_TASK" ]]; then
     GEMINI_CLI_TASKS="$SMOKE_TASK"
     GEMINI_CLI_AGENTS=6
     GEMINI_CLI_MAX_ITERATIONS=10
-    GEMINI_CLI_CONCURRENCY=1
+    GEMINI_CLI_CONCURRENCY=6
     RUN_NAME="SMOKE_${SMOKE_TASK}"
 else
     echo "=== Final ARC-AGI Run ==="
     GEMINI_CLI_TASKS="all"
     GEMINI_CLI_AGENTS=12
     GEMINI_CLI_MAX_ITERATIONS=10
-    GEMINI_CLI_CONCURRENCY=8
+    GEMINI_CLI_CONCURRENCY=16
     RUN_NAME="FINAL_RUN"
 fi
 
@@ -47,7 +47,7 @@ echo "Script dir: $SCRIPT_DIR"
 echo ""
 
 # ── Start solver ─────────────────────────────────────────────────────────
-LOCAL_LLM_MODEL="${LOCAL_LLM_MODEL:-unsloth/Qwen3.5-35B-A3B-GGUF}"
+LOCAL_LLM_MODEL="${LOCAL_LLM_MODEL:-unsloth/Qwen3.5-9B-GGUF}"
 
 echo "--- Starting local LLM solver ---"
 echo "[local-llm] model=$LOCAL_LLM_MODEL, $GEMINI_CLI_AGENTS agents, max-iterations $GEMINI_CLI_MAX_ITERATIONS"
@@ -58,7 +58,9 @@ uv run python orchestrator.py \
     --tasks "$GEMINI_CLI_TASKS" \
     --num-agents "$GEMINI_CLI_AGENTS" \
     --max-iterations "$GEMINI_CLI_MAX_ITERATIONS" \
-    --concurrency "${GEMINI_CLI_CONCURRENCY:-4}" \
+    --concurrency "${GEMINI_CLI_CONCURRENCY:-16}" \
+    --container-memory-gb "${CONTAINER_MEMORY_GB:-2.0}" \
+    --container-cpus "${CONTAINER_CPUS:-1.0}" \
     --model "$LOCAL_LLM_MODEL" \
     --name "$RUN_NAME" &
 PID_SOLVER=$!
