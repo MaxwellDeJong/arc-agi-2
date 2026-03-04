@@ -42,6 +42,34 @@ RESULTS = ROOT / "results"
 AGENT_RUNNER_PATH = ROOT / "agent_runner.py"
 LOCAL_CLI_PATH = ROOT / "local_agent_cli.py"
 
+# --- Cached file contents (read once at startup, not per container) ---
+_AGENT_RUNNER_CONTENT: str | None = None
+_LOCAL_CLI_CONTENT: str | None = None
+
+# --- Shared Docker client (one connection, reused across all containers) ---
+_docker_client: aiodocker.Docker | None = None
+
+
+def _get_docker_client() -> aiodocker.Docker:
+    global _docker_client
+    if _docker_client is None:
+        _docker_client = aiodocker.Docker()
+    return _docker_client
+
+
+def _get_agent_runner_content() -> str:
+    global _AGENT_RUNNER_CONTENT
+    if _AGENT_RUNNER_CONTENT is None:
+        _AGENT_RUNNER_CONTENT = AGENT_RUNNER_PATH.read_text()
+    return _AGENT_RUNNER_CONTENT
+
+
+def _get_local_cli_content() -> str:
+    global _LOCAL_CLI_CONTENT
+    if _LOCAL_CLI_CONTENT is None:
+        _LOCAL_CLI_CONTENT = LOCAL_CLI_PATH.read_text()
+    return _LOCAL_CLI_CONTENT
+
 
 # ── Docker Sandbox Helpers ────────────────────────────────────────────────
 
@@ -83,6 +111,8 @@ async def run_agent_in_docker(
     max_iterations: int,
     soft_training_feedback: bool,
     image: str = "arc-solver:latest",
+    container_memory_gb: float = 2.0,
+    container_cpus: float = 1.0,
 ) -> dict:
     """Run a Gemini CLI agent inside a Docker container.
 
@@ -94,7 +124,7 @@ async def run_agent_in_docker(
     container_start = time.time()
     container = None
     tmp_root = tmp_app = tmp_workspace = None
-    docker_client = aiodocker.Docker()
+    docker_client = _get_docker_client()
 
     try:
         # Step 1 — Create temp directories and write files
@@ -112,8 +142,8 @@ async def run_agent_in_docker(
             "soft_training_feedback": soft_training_feedback,
         }
         (Path(tmp_root) / "config.json").write_text(json.dumps(config))
-        (Path(tmp_app) / "agent_runner.py").write_text(AGENT_RUNNER_PATH.read_text())
-        (Path(tmp_app) / "local_agent_cli.py").write_text(LOCAL_CLI_PATH.read_text())
+        (Path(tmp_app) / "agent_runner.py").write_text(_get_agent_runner_content())
+        (Path(tmp_app) / "local_agent_cli.py").write_text(_get_local_cli_content())
 
         # Step 2 — Build environment variables
         envs: dict[str, str] = {}
@@ -126,6 +156,8 @@ async def run_agent_in_docker(
         envs["VLLM_API_KEY"] = os.environ.get("VLLM_API_KEY", "not-needed")
 
         # Step 3 — Run the container
+        memory_bytes = int(container_memory_gb * 1024 * 1024 * 1024)
+        nano_cpus = int(container_cpus * 10 ** 9)
         container = await docker_client.containers.run(
             config={
                 "Image": image,
@@ -137,8 +169,8 @@ async def run_agent_in_docker(
                         f"{tmp_app}:/app",
                         f"{tmp_workspace}:/workspace",
                     ],
-                    "Memory": 5 * 1024 * 1024 * 1024,  # 5 GiB
-                    "NanoCpus": 2 * 10 ** 9,            # 2 CPUs
+                    "Memory": memory_bytes,
+                    "NanoCpus": nano_cpus,
                     "AutoRemove": False,
                     "ExtraHosts": ["host.docker.internal:host-gateway"],
                 },
@@ -216,7 +248,6 @@ async def run_agent_in_docker(
                 await container.delete(force=True)
             except Exception:
                 pass
-        await docker_client.close()
         for tmp_dir in (tmp_root, tmp_app, tmp_workspace):
             if tmp_dir:
                 shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -664,6 +695,8 @@ async def process_task(
                 max_iterations=args.max_iterations,
                 soft_training_feedback=args.soft_training_feedback,
                 image=args.image,
+                container_memory_gb=args.container_memory_gb,
+                container_cpus=args.container_cpus,
             )
             agent_coros.append(_dispatch(agent_id, _kwargs, ti, agent_log_dir))
 
@@ -796,6 +829,10 @@ async def run_all(args: argparse.Namespace):
 
     completed = len(completed_tasks)
 
+    # Pre-load agent scripts into memory so every container creation skips disk I/O
+    _get_agent_runner_content()
+    _get_local_cli_content()
+
     # Build the Docker image before dispatching any agents
     await _build_image(args.image)
 
@@ -853,6 +890,12 @@ async def run_all(args: argparse.Namespace):
     }
     (run_dir / "summary.json").write_text(json.dumps(summary, indent=2))
 
+    # Close the shared Docker client
+    global _docker_client
+    if _docker_client is not None:
+        await _docker_client.close()
+        _docker_client = None
+
     print(f"\n{'='*60}")
     print(f"Done! {len(task_ids)} tasks, {total_tests} test inputs")
     print(f"Score with majority voting + pass@2 post-hoc")
@@ -875,10 +918,18 @@ def main():
                         help="Resume a previous run directory")
     parser.add_argument("--soft-training-feedback", action="store_true", default=False,
                         help="Use softer training failure message ('Try again' instead of 'Try a fundamentally different approach')")
-    parser.add_argument("--concurrency", type=int, default=8,
-                        help="Max simultaneous Docker containers (agent-level). Default: 8. Set to 0 for unlimited.")
+    parser.add_argument("--concurrency", type=int, default=16,
+                        help="Max simultaneous Docker containers. Default: 16. Set to 0 for unlimited. "
+                             "Higher values keep the GPU saturated by ensuring inference requests are "
+                             "always queued while other containers execute code.")
     parser.add_argument("--image", default="arc-solver:latest",
                         help="Docker image to use for agent containers (default: arc-solver:latest)")
+    parser.add_argument("--container-memory-gb", type=float, default=2.0,
+                        help="Memory limit per container in GiB (default: 2.0). "
+                             "Lower values allow more containers to run concurrently.")
+    parser.add_argument("--container-cpus", type=float, default=1.0,
+                        help="CPU limit per container (default: 1.0). "
+                             "Lower values allow more containers to run concurrently.")
     args = parser.parse_args()
 
     asyncio.run(run_all(args))
