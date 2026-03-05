@@ -47,7 +47,7 @@ echo "Script dir: $SCRIPT_DIR"
 echo ""
 
 # ── Start solver ─────────────────────────────────────────────────────────
-LOCAL_LLM_MODEL="${LOCAL_LLM_MODEL:-unsloth/Qwen3.5-9B-GGUF}"
+LOCAL_LLM_MODEL="${LOCAL_LLM_MODEL:-Qwen/Qwen3.5-9B}"
 
 echo "--- Starting local LLM solver ---"
 echo "[local-llm] model=$LOCAL_LLM_MODEL, $GEMINI_CLI_AGENTS agents, max-iterations $GEMINI_CLI_MAX_ITERATIONS"

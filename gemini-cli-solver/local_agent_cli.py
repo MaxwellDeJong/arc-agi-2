@@ -13,6 +13,7 @@ Usage:
 import argparse
 import json
 import os
+import random
 import subprocess
 import sys
 import time
@@ -256,6 +257,52 @@ def save_session(session_dir: Path, session: dict) -> None:
     (session_dir / "latest.json").write_text(json.dumps(session, indent=2))
 
 
+# ── API call with exponential backoff ─────────────────────────────────────
+
+# Errors that indicate a permanent (non-retryable) failure.
+_PERMANENT_API_ERRORS = ("exceed_context_size_error", "context_length_exceeded")
+
+# Maximum number of retry attempts after the initial failure.
+_MAX_API_RETRIES = 8
+
+# Backoff timing: starts at 5 s, doubles each attempt, caps at 5 min.
+_BACKOFF_BASE_SECONDS = 5.0
+_BACKOFF_MAX_SECONDS = 300.0
+
+
+def _call_api_with_backoff(client: "OpenAI", model: str, messages: list, tools: list):
+    """Call the chat completions API with exponential backoff for transient errors.
+
+    Retries up to _MAX_API_RETRIES times on connection/timeout errors.
+    Raises immediately for permanent errors (context overflow) or when
+    retries are exhausted.
+    """
+    for attempt in range(_MAX_API_RETRIES + 1):
+        try:
+            return client.chat.completions.create(
+                model=model,
+                messages=messages,
+                tools=tools,
+                tool_choice="auto",
+                stream=False,
+            )
+        except Exception as e:
+            err_str = str(e)
+            is_permanent = any(p in err_str for p in _PERMANENT_API_ERRORS)
+            if is_permanent or attempt >= _MAX_API_RETRIES:
+                raise
+            delay = min(
+                _BACKOFF_BASE_SECONDS * (2 ** attempt) + random.uniform(0, 1),
+                _BACKOFF_MAX_SECONDS,
+            )
+            print(
+                f"vLLM API error (attempt {attempt + 1}/{_MAX_API_RETRIES},"
+                f" retrying in {delay:.1f}s): {err_str}",
+                file=sys.stderr,
+            )
+            time.sleep(delay)
+
+
 # ── Main ───────────────────────────────────────────────────────────────────
 
 def main() -> int:
@@ -341,13 +388,7 @@ def main() -> int:
     try:
         while turns < max_turns and (time.time() - start_time) < max_time_minutes * 60:
             try:
-                response = client.chat.completions.create(
-                    model=model,
-                    messages=messages,
-                    tools=TOOLS,
-                    tool_choice="auto",
-                    stream=False,
-                )
+                response = _call_api_with_backoff(client, model, messages, TOOLS)
             except Exception as e:
                 err_str = str(e)
                 print(f"vLLM API error: {err_str}", file=sys.stderr)
@@ -355,7 +396,7 @@ def main() -> int:
                 # Context overflow: the session is permanently unresumable because
                 # every subsequent --resume call would reload the same overflowing
                 # history.  Delete the session file so agent_runner stops retrying.
-                if "exceed_context_size_error" in err_str or "context_length_exceeded" in err_str:
+                if any(p in err_str for p in _PERMANENT_API_ERRORS):
                     session_file = session_dir / "latest.json"
                     if session_file.exists():
                         session_file.unlink()
@@ -387,6 +428,12 @@ def main() -> int:
                 token_stats["input_tokens"] += incremental_input
                 token_stats["output_tokens"] += response.usage.completion_tokens or 0
                 prev_prompt_tokens = cur_prompt
+                # llama.cpp reports KV-cache hits in prompt_tokens_details.cached_tokens.
+                # Each call's value is the number of prompt tokens served from the
+                # prefix cache, so we accumulate (not delta) across calls.
+                details = getattr(response.usage, "prompt_tokens_details", None)
+                if details is not None:
+                    token_stats["cached_tokens"] += getattr(details, "cached_tokens", 0) or 0
 
             if not assistant_message.tool_calls:
                 break

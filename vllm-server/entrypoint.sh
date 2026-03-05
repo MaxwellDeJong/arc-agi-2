@@ -1,59 +1,46 @@
 #!/usr/bin/env bash
-# Download the GGUF model file (if not already cached) then launch llama-server.
+# Launch SGLang to serve Qwen/Qwen3.5-9B with an OpenAI-compatible API.
+# SGLang's RadixAttention (prefix caching) is enabled by default.
 set -euo pipefail
 
-echo "[llama-server] Model repo : ${MODEL_REPO}"
-echo "[llama-server] GGUF file  : ${GGUF_FILE}"
-echo "[llama-server] Model alias: ${SERVED_MODEL_NAME}"
-echo "[llama-server] Context len: ${CTX_SIZE}"
-echo "[llama-server] GPU layers : ${N_GPU_LAYERS}"
-echo "[llama-server] Parallel   : ${PARALLEL_REQUESTS}"
-echo "[llama-server] HF cache   : ${HF_HOME}"
+echo "[sglang] Model name    : ${MODEL_NAME}"
+echo "[sglang] Model alias   : ${SERVED_MODEL_NAME}"
+echo "[sglang] Quantization  : ${QUANTIZATION:-none}"
+echo "[sglang] Max context   : ${MAX_MODEL_LEN}"
+echo "[sglang] Mem fraction  : ${MEM_FRACTION_STATIC}"
+echo "[sglang] Tensor parallel: ${TENSOR_PARALLEL_SIZE}"
 echo ""
 
-# Download the GGUF file from HuggingFace (hf_hub_download is idempotent —
-# returns the cached path immediately if the file is already present).
-echo "[llama-server] Resolving model file from HuggingFace Hub..."
-GGUF_PATH=$(python3 - <<'EOF'
-import os
-from huggingface_hub import hf_hub_download
-path = hf_hub_download(
-    repo_id=os.environ["MODEL_REPO"],
-    filename=os.environ["GGUF_FILE"],
-    token=os.environ.get("HF_TOKEN"),   # optional; model is public
-)
-print(path)
-EOF
-)
-echo "[llama-server] Model file  : ${GGUF_PATH}"
-echo ""
-
-# llama-server is the binary name in recent llama.cpp releases.
-# The --jinja flag enables the Jinja2 chat template embedded in the GGUF file,
-# which is required for correct tool-call formatting with Qwen3.5.
-#
-# YaRN RoPE scaling is required when CTX_SIZE exceeds the model's native context
-# length (262,144 for Qwen3.5-9B).  The scale factor is ctx/native; enabling YaRN
-# on shorter contexts degrades performance, so we gate it conditionally.
-NATIVE_CTX=262144
-YARN_ARGS=()
-if (( CTX_SIZE > NATIVE_CTX )); then
-    ROPE_SCALE=$(python3 -c "print(${CTX_SIZE} / ${NATIVE_CTX})")
-    echo "[llama-server] CTX_SIZE (${CTX_SIZE}) > native (${NATIVE_CTX}): enabling YaRN (scale=${ROPE_SCALE})"
-    YARN_ARGS=(
-        --rope-scaling  yarn
-        --rope-scale    "${ROPE_SCALE}"
-        --yarn-orig-ctx "${NATIVE_CTX}"
-    )
+# Optional quantization flag — omitted entirely when QUANTIZATION is unset
+# or empty so SGLang defaults to BF16.
+QUANT_ARGS=()
+if [[ -n "${QUANTIZATION:-}" ]]; then
+    QUANT_ARGS=(--quantization "${QUANTIZATION}")
 fi
 
-exec /app/llama-server \
-    --model          "${GGUF_PATH}" \
-    --alias          "${SERVED_MODEL_NAME}" \
-    --host           0.0.0.0 \
-    --port           8000 \
-    --ctx-size       "${CTX_SIZE}" \
-    --n-gpu-layers   "${N_GPU_LAYERS}" \
-    --parallel       "${PARALLEL_REQUESTS}" \
-    "${YARN_ARGS[@]}" \
-    --jinja
+# YaRN RoPE scaling is required when MAX_MODEL_LEN exceeds Qwen3.5-9B's
+# native context of 262,144.  Scale factor = requested / native.
+NATIVE_CTX=262144
+OVERRIDE_ARGS=()
+if (( MAX_MODEL_LEN > NATIVE_CTX )); then
+    FACTOR=$(python3 -c "print(${MAX_MODEL_LEN} / ${NATIVE_CTX})")
+    echo "[sglang] MAX_MODEL_LEN (${MAX_MODEL_LEN}) > native (${NATIVE_CTX}): enabling YaRN (factor=${FACTOR})"
+    OVERRIDE_ARGS=(
+        --json-model-override-args
+        "{\"text_config\": {\"rope_parameters\": {\"mrope_interleaved\": true, \"mrope_section\": [11, 11, 10], \"rope_type\": \"yarn\", \"rope_theta\": 10000000, \"partial_rotary_factor\": 0.25, \"factor\": ${FACTOR}, \"original_max_position_embeddings\": ${NATIVE_CTX}}}}"
+    )
+    export SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1
+fi
+
+exec python -m sglang.launch_server \
+    --model-path             "${MODEL_NAME}" \
+    --served-model-name      "${SERVED_MODEL_NAME}" \
+    --host                   0.0.0.0 \
+    --port                   8000 \
+    --tp-size                "${TENSOR_PARALLEL_SIZE}" \
+    --mem-fraction-static    "${MEM_FRACTION_STATIC}" \
+    --context-length         "${MAX_MODEL_LEN}" \
+    --reasoning-parser       qwen3 \
+    --tool-call-parser       qwen3_coder \
+    "${QUANT_ARGS[@]}" \
+    "${OVERRIDE_ARGS[@]}"
